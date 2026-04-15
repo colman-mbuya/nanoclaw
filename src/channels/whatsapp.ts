@@ -6,6 +6,7 @@ import {
   makeWASocket,
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
   fetchLatestWaWebVersion,
   makeCacheableSignalKeyStore,
   normalizeMessageContent,
@@ -291,7 +292,40 @@ export class WhatsAppChannel implements Channel {
               normalized.extendedTextMessage?.text ||
               normalized.imageMessage?.caption ||
               normalized.videoMessage?.caption ||
+              normalized.documentMessage?.caption ||
               '';
+
+            // Handle text file attachments: download and inline the content
+            const docMsg = normalized.documentMessage;
+            if (docMsg) {
+              const mime = docMsg.mimetype || '';
+              const fileName = docMsg.fileName || 'unknown';
+              const isTextFile =
+                mime.startsWith('text/') ||
+                mime === 'application/json' ||
+                mime === 'application/xml' ||
+                /\.(txt|md|csv|json|xml|yaml|yml|log|ini|cfg|conf|sh|py|js|ts|html|css|sql|env)$/i.test(fileName);
+              if (isTextFile) {
+                try {
+                  const buffer = await downloadMediaMessage(
+                    msg,
+                    'buffer',
+                    {},
+                  ) as Buffer;
+                  const textContent = buffer.toString('utf-8');
+                  const header = `[File: ${fileName}]`;
+                  content = content
+                    ? `${content}\n\n${header}\n${textContent}`
+                    : `${header}\n${textContent}`;
+                } catch (err) {
+                  logger.warn({ err, fileName }, 'Failed to download text file attachment');
+                  content = content || `[File: ${fileName} — download failed]`;
+                }
+              } else {
+                // Non-text document: mention it so the agent knows a file was sent
+                content = content || `[File attached: ${fileName} (${mime})]`;
+              }
+            }
 
             // WhatsApp group mentions use the LID in raw text (e.g. "@80355281346633")
             // instead of the display name. Normalize to @AssistantName for trigger matching.
@@ -391,7 +425,11 @@ export class WhatsAppChannel implements Channel {
   }
 
   ownsJid(jid: string): boolean {
-    return jid.endsWith('@g.us') || jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid');
+    return (
+      jid.endsWith('@g.us') ||
+      jid.endsWith('@s.whatsapp.net') ||
+      jid.endsWith('@lid')
+    );
   }
 
   async disconnect(): Promise<void> {
