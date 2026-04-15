@@ -304,21 +304,26 @@ export class WhatsAppChannel implements Channel {
                 mime.startsWith('text/') ||
                 mime === 'application/json' ||
                 mime === 'application/xml' ||
-                /\.(txt|md|csv|json|xml|yaml|yml|log|ini|cfg|conf|sh|py|js|ts|html|css|sql|env)$/i.test(fileName);
+                /\.(txt|md|csv|json|xml|yaml|yml|log|ini|cfg|conf|sh|py|js|ts|html|css|sql|env)$/i.test(
+                  fileName,
+                );
               if (isTextFile) {
                 try {
-                  const buffer = await downloadMediaMessage(
+                  const buffer = (await downloadMediaMessage(
                     msg,
                     'buffer',
                     {},
-                  ) as Buffer;
+                  )) as Buffer;
                   const textContent = buffer.toString('utf-8');
                   const header = `[File: ${fileName}]`;
                   content = content
                     ? `${content}\n\n${header}\n${textContent}`
                     : `${header}\n${textContent}`;
                 } catch (err) {
-                  logger.warn({ err, fileName }, 'Failed to download text file attachment');
+                  logger.warn(
+                    { err, fileName },
+                    'Failed to download text file attachment',
+                  );
                   content = content || `[File: ${fileName} — download failed]`;
                 }
               } else {
