@@ -176,6 +176,13 @@ function buildVolumeMounts(
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
+      // Remove anything at the destination (file, symlink, or stale dir) so
+      // cpSync can lay down a clean directory. fs.cpSync's `force: true` does
+      // not handle the case where the destination is a non-directory but the
+      // source is a directory — the agent install creates symlinks like this.
+      if (fs.existsSync(dstDir) || fs.lstatSync(dstDir, { throwIfNoEntry: false })) {
+        fs.rmSync(dstDir, { recursive: true, force: true });
+      }
       fs.cpSync(srcDir, dstDir, { recursive: true });
     }
   }
