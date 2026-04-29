@@ -145,28 +145,54 @@ function buildVolumeMounts(
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(
-        {
-          env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-          },
-        },
-        null,
-        2,
-      ) + '\n',
-    );
+
+  // Bot-config env vars that must always be present for Claude Code's
+  // sub-agent / memory features to behave correctly.
+  const botEnv: Record<string, string> = {
+    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+    CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+    // Bypass the OneCLI gateway for hosts whose API the gateway can't proxy
+    // cleanly. Sub-agents inherit this so their HTTP clients hit Firecrawl
+    // directly using the API key from the env.
+    NO_PROXY: 'api.firecrawl.dev,firecrawl.dev',
+    no_proxy: 'api.firecrawl.dev,firecrawl.dev',
+  };
+
+  // Pass through every key=value in the group's .env so spawned sub-agents
+  // (which run as separate `claude` CLI subprocesses) inherit credentials
+  // like FIRECRAWL_API_KEY. Without this, only the parent agent has them.
+  const groupEnvFile = path.join(groupDir, '.env');
+  const passthroughEnv: Record<string, string> = {};
+  if (fs.existsSync(groupEnvFile)) {
+    const content = fs.readFileSync(groupEnvFile, 'utf-8');
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq < 1) continue;
+      const key = trimmed.slice(0, eq).trim();
+      let value = trimmed.slice(eq + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      passthroughEnv[key] = value;
+    }
   }
+
+  // Bot config wins on conflict so the user can't accidentally break
+  // sub-agents by setting one of those keys in their group .env.
+  const mergedEnv = { ...passthroughEnv, ...botEnv };
+
+  // Always overwrite settings.json so .env changes take effect on next spawn
+  // without requiring the user to delete the file manually.
+  fs.writeFileSync(
+    settingsFile,
+    JSON.stringify({ env: mergedEnv }, null, 2) + '\n',
+  );
 
   // Sync skills from container/skills/ into each group's .claude/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
@@ -180,7 +206,10 @@ function buildVolumeMounts(
       // cpSync can lay down a clean directory. fs.cpSync's `force: true` does
       // not handle the case where the destination is a non-directory but the
       // source is a directory — the agent install creates symlinks like this.
-      if (fs.existsSync(dstDir) || fs.lstatSync(dstDir, { throwIfNoEntry: false })) {
+      if (
+        fs.existsSync(dstDir) ||
+        fs.lstatSync(dstDir, { throwIfNoEntry: false })
+      ) {
         fs.rmSync(dstDir, { recursive: true, force: true });
       }
       fs.cpSync(srcDir, dstDir, { recursive: true });
@@ -259,6 +288,13 @@ async function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Hosts that should bypass the OneCLI gateway. The gateway intercepts and
+  // sometimes mangles requests for services it does not have a credential
+  // type for (e.g. Firecrawl returning 400). For these the agent already has
+  // the raw API key in its env via group .env / settings.json injection.
+  args.push('-e', 'NO_PROXY=api.firecrawl.dev,firecrawl.dev');
+  args.push('-e', 'no_proxy=api.firecrawl.dev,firecrawl.dev');
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
