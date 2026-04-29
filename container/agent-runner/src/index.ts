@@ -450,6 +450,35 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
+  // Load /workspace/group/.env into process.env so CLI tools spawned by the
+  // agent (e.g. firecrawl, gh, gcloud) inherit the group's secrets.
+  const groupEnvPath = '/workspace/group/.env';
+  if (fs.existsSync(groupEnvPath)) {
+    const content = fs.readFileSync(groupEnvPath, 'utf-8');
+    let loaded = 0;
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq < 1) continue;
+      const key = trimmed.slice(0, eq).trim();
+      let value = trimmed.slice(eq + 1).trim();
+      // Strip surrounding quotes if present
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      // Don't overwrite existing env (host-injected creds win)
+      if (process.env[key] === undefined) {
+        process.env[key] = value;
+        loaded++;
+      }
+    }
+    if (loaded > 0) log(`Loaded ${loaded} env var(s) from group .env`);
+  }
+
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
