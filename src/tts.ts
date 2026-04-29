@@ -165,7 +165,11 @@ export async function synthesizeSpeech(text: string): Promise<Buffer | null> {
     });
     const arrayBuffer = await response.arrayBuffer();
     logger.info(
-      { usedLLM: !!llmVersion, originalLength: text.length, speakableLength: speakable.length },
+      {
+        usedLLM: !!llmVersion,
+        originalLength: text.length,
+        speakableLength: speakable.length,
+      },
       'Speech synthesis completed',
     );
     return Buffer.from(arrayBuffer);

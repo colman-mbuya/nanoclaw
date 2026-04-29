@@ -112,7 +112,9 @@ describe('prepareForSpeech', () => {
 
     it('replaces code blocks with placeholder', () => {
       expect(
-        prepareForSpeech('Here is some code:\n```\nconsole.log("hi");\n```\nDone'),
+        prepareForSpeech(
+          'Here is some code:\n```\nconsole.log("hi");\n```\nDone',
+        ),
       ).toBe('Here is some code: code omitted Done');
     });
   });
@@ -157,9 +159,7 @@ describe('prepareForSpeech', () => {
     });
 
     it('collapses multiple spaces', () => {
-      expect(prepareForSpeech('too   many    spaces')).toBe(
-        'too many spaces',
-      );
+      expect(prepareForSpeech('too   many    spaces')).toBe('too many spaces');
     });
   });
 
