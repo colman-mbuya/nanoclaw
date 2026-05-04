@@ -80,6 +80,8 @@ export class WhatsAppChannel implements Channel {
   private botLidUser?: string;
   /** Resolve the initial connect() once the first successful open happens. */
   private pendingFirstOpen?: () => void;
+  /** Per-chat: was the most recent inbound user message a voice note? */
+  private lastInboundWasVoice = new Map<string, boolean>();
 
   private opts: WhatsAppChannelOpts;
 
@@ -391,6 +393,12 @@ export class WhatsAppChannel implements Channel {
             }
           }
 
+          // Track whether the most recent user message was a voice note,
+          // so sendMessage can decide whether to also send a voice reply.
+          if (!isBotMessage) {
+            this.lastInboundWasVoice.set(chatJid, isVoiceMessage(msg));
+          }
+
           this.opts.onMessage(chatJid, {
             id: msg.key.id || '',
             chat_jid: chatJid,
@@ -454,9 +462,14 @@ export class WhatsAppChannel implements Channel {
       return;
     }
 
-    // Also send a voice note version of the reply. Best-effort: failures
-    // (TTS error, too-long text, audio send error) are logged and ignored
-    // since the text has already been delivered.
+    // Mirror voice-only: send a voice note alongside the text only when the
+    // user's most recent message in this chat was itself a voice note. Text
+    // replies stay text-only to avoid unwanted audio for typed conversations.
+    if (!this.lastInboundWasVoice.get(jid)) return;
+
+    // Best-effort voice synthesis: failures (TTS error, too-long text, audio
+    // send error) are logged and ignored since the text has already been
+    // delivered.
     const audio = await synthesizeSpeech(text);
     if (!audio) return;
     try {
