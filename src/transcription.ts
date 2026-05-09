@@ -94,5 +94,11 @@ export async function transcribeAudioMessage(
 }
 
 export function isVoiceMessage(msg: WAMessage): boolean {
-  return msg.message?.audioMessage?.ptt === true;
+  const audio = msg.message?.audioMessage;
+  if (!audio) return false;
+  // Recorded voice notes have ptt: true. Forwarded voice notes lose the flag
+  // but keep the opus codec — match those too. Music attachments use other
+  // mimetypes (audio/mpeg, audio/mp4) so they won't match.
+  if (audio.ptt === true) return true;
+  return /opus/i.test(audio.mimetype || '');
 }
