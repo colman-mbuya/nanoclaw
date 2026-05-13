@@ -54,6 +54,71 @@ import { registerChannel, ChannelOpts } from './registry.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+const ATTACH_PATTERN = /\[Attach:\s*([^\]\n]+)\]/g;
+
+const MIMETYPES: Record<string, string> = {
+  '.html': 'text/html',
+  '.htm': 'text/html',
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain',
+  '.md': 'text/markdown',
+  '.csv': 'text/csv',
+  '.json': 'application/json',
+  '.xml': 'application/xml',
+  '.yaml': 'application/x-yaml',
+  '.yml': 'application/x-yaml',
+  '.log': 'text/plain',
+  '.js': 'application/javascript',
+  '.ts': 'application/typescript',
+  '.py': 'text/x-python',
+  '.sh': 'application/x-sh',
+  '.zip': 'application/zip',
+  '.tar': 'application/x-tar',
+  '.gz': 'application/gzip',
+  '.docx':
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.pptx':
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+};
+
+function mimetypeForExt(ext: string): string {
+  return MIMETYPES[ext.toLowerCase()] || 'application/octet-stream';
+}
+
+/**
+ * Pull `[Attach: relative/path]` markers out of agent output, returning the
+ * list of relative paths and the text with markers (and any line they sat on
+ * alone) stripped.
+ */
+function extractAttachments(text: string): {
+  cleanedText: string;
+  attachments: string[];
+} {
+  const attachments: string[] = [];
+  // Collect paths from markers anywhere in the text.
+  for (const m of text.matchAll(ATTACH_PATTERN)) {
+    attachments.push(m[1].trim());
+  }
+  if (attachments.length === 0) return { cleanedText: text.trim(), attachments };
+  // Remove markers and any blank lines they leave behind.
+  const cleaned = text
+    .replace(ATTACH_PATTERN, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return { cleanedText: cleaned, attachments };
+}
+
 export interface WhatsAppChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
@@ -425,13 +490,35 @@ export class WhatsAppChannel implements Channel {
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
+    // Extract any [Attach: path] markers — agents use these to send files.
+    const { cleanedText, attachments } = extractAttachments(text);
+
+    // Send each attachment as a document. Best-effort: a failure on one
+    // doesn't stop the rest, and the cleaned text still gets sent.
+    if (this.connected && attachments.length > 0) {
+      const group = this.opts.registeredGroups()[jid];
+      if (group) {
+        for (const rel of attachments) {
+          await this.sendFileAttachment(jid, group.folder, rel);
+        }
+      } else {
+        logger.warn({ jid }, 'Attach marker but JID not in registered groups');
+      }
+    }
+
+    // If after stripping attachments there's no text left, we're done —
+    // unless the user sent a voice note, in which case we still want a
+    // voice reply summarizing the file send.
+    if (!cleanedText && !this.lastInboundWasVoice.get(jid)) return;
+    const effectiveText = cleanedText || 'Sent.';
+
     // Prefix bot messages with assistant name so users know who's speaking.
     // On a shared number, prefix is also needed in DMs (including self-chat)
     // to distinguish bot output from user messages.
     // Skip only when the assistant has its own dedicated phone number.
     const prefixed = ASSISTANT_HAS_OWN_NUMBER
-      ? text
-      : `${ASSISTANT_NAME}: ${text}`;
+      ? effectiveText
+      : `${ASSISTANT_NAME}: ${effectiveText}`;
 
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text: prefixed });
@@ -470,7 +557,7 @@ export class WhatsAppChannel implements Channel {
     // Best-effort voice synthesis: failures (TTS error, too-long text, audio
     // send error) are logged and ignored since the text has already been
     // delivered.
-    const audio = await synthesizeSpeech(text);
+    const audio = await synthesizeSpeech(effectiveText);
     if (!audio) return;
     try {
       const sent = await this.sock.sendMessage(jid, {
@@ -491,6 +578,57 @@ export class WhatsAppChannel implements Channel {
       );
     } catch (err) {
       logger.warn({ jid, err }, 'Voice note send failed (text already sent)');
+    }
+  }
+
+  /**
+   * Read a file from the group folder and send it as a WhatsApp document.
+   * The relative path is resolved against the host-side group dir and
+   * checked to stay inside it (no .. escapes).
+   */
+  private async sendFileAttachment(
+    jid: string,
+    groupFolder: string,
+    relativePath: string,
+  ): Promise<void> {
+    const groupRoot = path.resolve(GROUPS_DIR, groupFolder);
+    const resolved = path.resolve(groupRoot, relativePath);
+    if (!resolved.startsWith(groupRoot + path.sep) && resolved !== groupRoot) {
+      logger.warn(
+        { jid, relativePath },
+        'Attach path escapes group folder, skipping',
+      );
+      return;
+    }
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+      logger.warn(
+        { jid, resolved },
+        'Attach path does not point to a file, skipping',
+      );
+      return;
+    }
+    const buffer = fs.readFileSync(resolved);
+    const fileName = path.basename(resolved);
+    const mimetype = mimetypeForExt(path.extname(fileName));
+    try {
+      const sent = await this.sock.sendMessage(jid, {
+        document: buffer,
+        fileName,
+        mimetype,
+      });
+      if (sent?.key?.id && sent.message) {
+        this.sentMessageCache.set(sent.key.id, sent.message);
+        if (this.sentMessageCache.size > 256) {
+          const oldest = this.sentMessageCache.keys().next().value!;
+          this.sentMessageCache.delete(oldest);
+        }
+      }
+      logger.info(
+        { jid, fileName, mimetype, bytes: buffer.length },
+        'Attachment sent',
+      );
+    } catch (err) {
+      logger.warn({ jid, fileName, err }, 'Attachment send failed');
     }
   }
 
