@@ -1,0 +1,80 @@
+464772c feat: zip support, binary attachment downloads, model pin, PDF parsing
+b1aadf7 feat(whatsapp): agent can send files via [Attach: path] marker
+ab457e0 fix(whatsapp): detect forwarded voice notes (no ptt flag)
+bc7ee0a feat(whatsapp): only send voice note reply when user sent voice
+01c3250 container: bypass OneCLI proxy for Firecrawl
+44bf030 fix(container): cleanly replace existing skill paths during sync
+42093b1 style: prettier formatting
+e0d92c1 container/global: add firecrawl skill and global pointer
+f2723a5 container: auto-load /workspace/group/.env into process.env
+7a7f59a container: install firecrawl-cli globally in Dockerfile
+f15084f feat(whatsapp): add image vision via sharp + multimodal blocks
+32710ee feat(whatsapp): add TTS voice replies via OpenAI
+ca2980c feat(whatsapp): add voice message transcription via OpenAI Whisper
+d408469 style: prettier formatting
+bbdb8a5 feat(whatsapp): add text file attachment support
+d2766fd setup: configure NanoClaw with WhatsApp, LID JID fix, and SAST timezone
+bcb49ee Merge remote-tracking branch 'whatsapp/main'
+812c844 Merge remote-tracking branch 'upstream/main' into sync-wa
+3618945 Merge pull request #89 from qwibitai/fix/whatsapp-auth-proto-cjs
+a0bf89d fix: import proto via createRequire (not ESM named export)
+42b3117 Merge pull request #88 from qwibitai/fix/whatsapp-auth-platform-id
+1bd8f06 fix: move getPlatformId patch to whatsapp-auth.ts
+876e29b Merge pull request #87 from qwibitai/fix/baileys-platform-id
+c0863cc fix: use createRequire for getPlatformId patch (ESM read-only namespace)
+5846cfc Merge pull request #86 from qwibitai/fix/baileys-platform-id
+435b415 fix: patch Baileys 6.x getPlatformId bug for pairing codes
+4a030ef Merge pull request #84 from qwibitai/whatsapp-fixes
+e996415 chore: strip debug logging, add getMessageContentById to db
+87132a3 fix: bump Baileys to ^6.17.16
+468625c fix: Baileys 6.17 compat, getMessage retry, debug logging
+43b03d6 Merge branch 'main' into whatsapp-merge
+8441fe0 merge: catch up with upstream nanoclaw main
+6d887eb docs: update token count to 44.8k tokens · 22% of context window
+3e7f19c chore: bump version to 1.2.27
+52e54c9 Merge pull request #82 from lazer-sketch/fix/whatsapp-lid-jid-fallback
+d1381ea fix: normalize LID mentions in group messages for trigger matching
+c3d349a fix: add getMessage callback to prevent "Waiting for this message"
+45f302a docs: pass --dedicated-number flag in add-whatsapp SKILL.md
+2186208 fix: add senderPn fallback for LID JID translation, log unmatched messages
+a3f2af5 chore: remove auto-sync GitHub Actions
+4d84d5d Merge branch 'main' into skill/image-vision
+937efe8 docs: update token count to 44.2k tokens · 22% of context window
+b0995c0 chore: bump version to 1.2.26
+a23fee2 fix: replace grammy with @whiskeysockets/baileys, remove leaked telegram files
+336c5a4 docs: update token count to 46.5k tokens · 23% of context window
+6eabc1a chore: bump version to 1.2.25
+9952a0e Merge remote-tracking branch 'upstream/main'
+f9b6ee3 Merge branch 'main' into skill/voice-transcription
+54d4279 Merge branch 'main' into skill/image-vision
+2a2ab2a chore: bump version to 1.2.14
+779de64 Merge branch 'main' into skill/image-vision
+b6fb897 Merge remote-tracking branch 'upstream/main'
+9df993b Merge branch 'main' into skill/voice-transcription
+ca0bd0f Merge branch 'main' into skill/image-vision
+5672548 Merge remote-tracking branch 'upstream/main'
+b1112dc Merge branch 'main' into skill/voice-transcription
+9ca44ce Merge branch 'main' into skill/image-vision
+d955147 Merge remote-tracking branch 'upstream/main'
+da2ac9c Merge branch 'main' into skill/voice-transcription
+ed76190 Merge branch 'main' into skill/image-vision
+aa81de7 docs: update token count to 43.1k tokens · 22% of context window
+45a6713 Merge branch 'main' into skill/image-vision
+61ccfba Merge remote-tracking branch 'upstream/main'
+e3b5775 Merge branch 'main' into skill/voice-transcription
+0fa27b2 Merge branch 'main' into skill/image-vision
+4cab695 Merge remote-tracking branch 'upstream/main'
+2c170f8 Merge branch 'main' into skill/voice-transcription
+a5cd5d1 Merge branch 'main' into skill/image-vision
+3c2f30f Merge remote-tracking branch 'upstream/main'
+e34724d Merge branch 'main' into skill/voice-transcription
+1219fc4 Merge branch 'main' into skill/image-vision
+0c5f7bd fix: add concurrency group to prevent parallel fork-sync races
+fb81d6d Merge branch 'main' into skill/voice-transcription
+7ee8d58 Merge branch 'main' into skill/image-vision
+a30471d Merge remote-tracking branch 'upstream/main'
+843cf41 Merge branch 'main' into skill/voice-transcription
+b42530d Merge branch 'main' into skill/image-vision
+afac3ff fix: re-fetch before skill branch merges to avoid stale refs
+905541c Merge branch 'main' into skill/voice-transcription
+71a3282 Merge branch 'main' into skill/image-vision

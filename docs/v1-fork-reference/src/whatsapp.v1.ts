@@ -1,0 +1,855 @@
+import { exec } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+
+import {
+  makeWASocket,
+  Browsers,
+  DisconnectReason,
+  downloadMediaMessage,
+  fetchLatestWaWebVersion,
+  makeCacheableSignalKeyStore,
+  normalizeMessageContent,
+  useMultiFileAuthState,
+} from '@whiskeysockets/baileys';
+import type {
+  GroupMetadata,
+  WAMessageKey,
+  WASocket,
+  proto as ProtoTypes,
+} from '@whiskeysockets/baileys';
+// proto is not statically analyzable as a named ESM export from this CJS module
+import { createRequire } from 'module';
+const { proto } = createRequire(import.meta.url)('@whiskeysockets/baileys') as {
+  proto: typeof ProtoTypes;
+};
+
+import {
+  ASSISTANT_HAS_OWN_NUMBER,
+  ASSISTANT_NAME,
+  GROUPS_DIR,
+  STORE_DIR,
+} from '../config.js';
+import {
+  getLastGroupSync,
+  getMessageContentById,
+  setLastGroupSync,
+  updateChatName,
+} from '../db.js';
+import { isImageMessage, processImage } from '../image.js';
+import { logger } from '../logger.js';
+import pino from 'pino';
+
+// Baileys requires a pino-compatible logger instance
+const baileysLogger = pino({ level: 'silent' });
+import { isVoiceMessage, transcribeAudioMessage } from '../transcription.js';
+import { synthesizeSpeech } from '../tts.js';
+import {
+  Channel,
+  OnInboundMessage,
+  OnChatMetadata,
+  RegisteredGroup,
+} from '../types.js';
+import { registerChannel, ChannelOpts } from './registry.js';
+
+const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+const ATTACH_PATTERN = /\[Attach:\s*([^\]\n]+)\]/g;
+
+const MIMETYPES: Record<string, string> = {
+  '.html': 'text/html',
+  '.htm': 'text/html',
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain',
+  '.md': 'text/markdown',
+  '.csv': 'text/csv',
+  '.json': 'application/json',
+  '.xml': 'application/xml',
+  '.yaml': 'application/x-yaml',
+  '.yml': 'application/x-yaml',
+  '.log': 'text/plain',
+  '.js': 'application/javascript',
+  '.ts': 'application/typescript',
+  '.py': 'text/x-python',
+  '.sh': 'application/x-sh',
+  '.zip': 'application/zip',
+  '.tar': 'application/x-tar',
+  '.gz': 'application/gzip',
+  '.docx':
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.pptx':
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+};
+
+function mimetypeForExt(ext: string): string {
+  return MIMETYPES[ext.toLowerCase()] || 'application/octet-stream';
+}
+
+/**
+ * Pull `[Attach: relative/path]` markers out of agent output, returning the
+ * list of relative paths and the text with markers (and any line they sat on
+ * alone) stripped.
+ */
+function extractAttachments(text: string): {
+  cleanedText: string;
+  attachments: string[];
+} {
+  const attachments: string[] = [];
+  // Collect paths from markers anywhere in the text.
+  for (const m of text.matchAll(ATTACH_PATTERN)) {
+    attachments.push(m[1].trim());
+  }
+  if (attachments.length === 0)
+    return { cleanedText: text.trim(), attachments };
+  // Remove markers and any blank lines they leave behind.
+  const cleaned = text
+    .replace(ATTACH_PATTERN, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return { cleanedText: cleaned, attachments };
+}
+
+export interface WhatsAppChannelOpts {
+  onMessage: OnInboundMessage;
+  onChatMetadata: OnChatMetadata;
+  registeredGroups: () => Record<string, RegisteredGroup>;
+}
+
+export class WhatsAppChannel implements Channel {
+  name = 'whatsapp';
+
+  private sock!: WASocket;
+  private connected = false;
+  private lidToPhoneMap: Record<string, string> = {};
+  private outgoingQueue: Array<{ jid: string; text: string }> = [];
+  private flushing = false;
+  private groupSyncTimerStarted = false;
+  /** Cache of recently sent messages for retry requests (max 256 entries). */
+  private sentMessageCache = new Map<string, ProtoTypes.IMessage>();
+  /** Short-lived cache of phone-normalized group metadata for outbound sends. */
+  private groupMetadataCache = new Map<
+    string,
+    { metadata: GroupMetadata; expiresAt: number }
+  >();
+  /** Bot's LID user ID (e.g. "80355281346633") for normalizing group mentions. */
+  private botLidUser?: string;
+  /** Resolve the initial connect() once the first successful open happens. */
+  private pendingFirstOpen?: () => void;
+  /** Per-chat: was the most recent inbound user message a voice note? */
+  private lastInboundWasVoice = new Map<string, boolean>();
+
+  private opts: WhatsAppChannelOpts;
+
+  constructor(opts: WhatsAppChannelOpts) {
+    this.opts = opts;
+  }
+
+  async connect(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      this.pendingFirstOpen = resolve;
+      this.connectInternal().catch(reject);
+    });
+  }
+
+  private async connectInternal(): Promise<void> {
+    const authDir = path.join(STORE_DIR, 'auth');
+    fs.mkdirSync(authDir, { recursive: true });
+
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+
+    const { version } = await fetchLatestWaWebVersion({}).catch((err) => {
+      logger.warn(
+        { err },
+        'Failed to fetch latest WA Web version, using default',
+      );
+      return { version: undefined };
+    });
+    this.sock = makeWASocket({
+      version,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
+      },
+      printQRInTerminal: false,
+      logger: baileysLogger,
+      browser: Browsers.macOS('Chrome'),
+      cachedGroupMetadata: async (jid: string) =>
+        this.getNormalizedGroupMetadata(jid),
+      getMessage: async (key: WAMessageKey) => {
+        const cached = this.sentMessageCache.get(key.id || '');
+        if (cached) {
+          logger.debug(
+            { id: key.id },
+            'getMessage: returning cached message for retry',
+          );
+          return cached;
+        }
+        // Fall back to DB lookup so WhatsApp can re-encrypt on retry.
+        // Without this, self-chat messages show "waiting for this message".
+        const content =
+          key.id && key.remoteJid
+            ? getMessageContentById(key.id, key.remoteJid)
+            : undefined;
+        if (content) {
+          logger.debug(
+            { id: key.id },
+            'getMessage: returning DB message for retry',
+          );
+          return proto.Message.fromObject({ conversation: content });
+        }
+        // Return empty message rather than undefined — prevents indefinite
+        // "waiting for this message" when we genuinely don't have the content.
+        return proto.Message.fromObject({});
+      },
+    });
+
+    this.sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        const msg =
+          'WhatsApp authentication required. Run /setup in Claude Code.';
+        logger.error(msg);
+        exec(
+          `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
+        );
+        setTimeout(() => process.exit(1), 1000);
+      }
+
+      if (connection === 'close') {
+        this.connected = false;
+        const reason = (
+          lastDisconnect?.error as { output?: { statusCode?: number } }
+        )?.output?.statusCode;
+        const shouldReconnect = reason !== DisconnectReason.loggedOut;
+        logger.info(
+          {
+            reason,
+            shouldReconnect,
+            queuedMessages: this.outgoingQueue.length,
+          },
+          'Connection closed',
+        );
+
+        if (shouldReconnect) {
+          this.scheduleReconnect(1);
+        } else {
+          logger.info('Logged out. Run /setup to re-authenticate.');
+          process.exit(0);
+        }
+      } else if (connection === 'open') {
+        this.connected = true;
+        logger.info('Connected to WhatsApp');
+
+        // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)
+        this.sock.sendPresenceUpdate('available').catch((err) => {
+          logger.warn({ err }, 'Failed to send presence update');
+        });
+
+        // Build LID to phone mapping from auth state for self-chat translation
+        if (this.sock.user) {
+          const phoneUser = this.sock.user.id.split(':')[0];
+          const lidUser = this.sock.user.lid?.split(':')[0];
+          if (lidUser && phoneUser) {
+            this.setLidPhoneMapping(lidUser, `${phoneUser}@s.whatsapp.net`);
+            this.botLidUser = lidUser;
+            logger.debug({ lidUser, phoneUser }, 'LID to phone mapping set');
+          }
+        }
+
+        // Flush any messages queued while disconnected
+        this.flushOutgoingQueue().catch((err) =>
+          logger.error({ err }, 'Failed to flush outgoing queue'),
+        );
+
+        // Sync group metadata on startup (respects 24h cache)
+        this.syncGroupMetadata().catch((err) =>
+          logger.error({ err }, 'Initial group sync failed'),
+        );
+        // Set up daily sync timer (only once)
+        if (!this.groupSyncTimerStarted) {
+          this.groupSyncTimerStarted = true;
+          setInterval(() => {
+            this.syncGroupMetadata().catch((err) =>
+              logger.error({ err }, 'Periodic group sync failed'),
+            );
+          }, GROUP_SYNC_INTERVAL_MS);
+        }
+
+        // Signal first connection to caller
+        if (this.pendingFirstOpen) {
+          this.pendingFirstOpen();
+          this.pendingFirstOpen = undefined;
+        }
+      }
+    });
+
+    this.sock.ev.on('creds.update', saveCreds);
+
+    (this.sock.ev as any).on(
+      'chats.phoneNumberShare',
+      ({ lid, jid }: { lid: string; jid: string }) => {
+        const lidUser = lid?.split('@')[0].split(':')[0];
+        if (lidUser && jid) {
+          this.setLidPhoneMapping(lidUser, jid);
+        }
+      },
+    );
+
+    this.sock.ev.on('messages.upsert', async ({ messages }) => {
+      for (const msg of messages) {
+        if (!msg.message) continue;
+        // Unwrap container types (viewOnceMessageV2, ephemeralMessage,
+        // editedMessage, etc.) so that conversation, extendedTextMessage,
+        // imageMessage, etc. are accessible at the top level.
+        const normalized = normalizeMessageContent(msg.message);
+        if (!normalized) continue;
+        const rawJid = msg.key.remoteJid;
+        if (!rawJid || rawJid === 'status@broadcast') continue;
+
+        // Translate LID JID to phone JID if applicable.
+        // Prefer senderPn from the message key (available in newer WA protocol)
+        // since translateJid may fail to resolve LID→phone via signalRepository.
+        let chatJid = await this.translateJid(rawJid);
+        if (chatJid.endsWith('@lid') && (msg.key as any).senderPn) {
+          const pn = (msg.key as any).senderPn as string;
+          const phoneJid = pn.includes('@') ? pn : `${pn}@s.whatsapp.net`;
+          this.setLidPhoneMapping(rawJid.split('@')[0].split(':')[0], phoneJid);
+          chatJid = phoneJid;
+          logger.info(
+            { lidJid: rawJid, phoneJid },
+            'Translated LID via senderPn',
+          );
+        }
+
+        const timestamp = new Date(
+          Number(msg.messageTimestamp) * 1000,
+        ).toISOString();
+
+        // Always notify about chat metadata for group discovery
+        const isGroup = chatJid.endsWith('@g.us');
+        this.opts.onChatMetadata(
+          chatJid,
+          timestamp,
+          undefined,
+          'whatsapp',
+          isGroup,
+        );
+
+        // Only deliver full message for registered groups
+        const groups = this.opts.registeredGroups();
+        if (groups[chatJid]) {
+          let content =
+            normalized.conversation ||
+            normalized.extendedTextMessage?.text ||
+            normalized.imageMessage?.caption ||
+            normalized.videoMessage?.caption ||
+            normalized.documentMessage?.caption ||
+            '';
+
+          // Image attachment handling — download, resize, encode for vision
+          if (isImageMessage(msg)) {
+            try {
+              const buffer = (await downloadMediaMessage(
+                msg,
+                'buffer',
+                {},
+              )) as Buffer;
+              const groupDir = path.join(GROUPS_DIR, groups[chatJid].folder);
+              const caption = normalized.imageMessage?.caption ?? '';
+              const result = await processImage(buffer, groupDir, caption);
+              if (result) {
+                content = result.content;
+              }
+            } catch (err) {
+              logger.warn({ err, jid: chatJid }, 'Image - download failed');
+            }
+          }
+
+          // Handle text file attachments: download and inline the content
+          const docMsg = normalized.documentMessage;
+          if (docMsg) {
+            const mime = docMsg.mimetype || '';
+            const fileName = docMsg.fileName || 'unknown';
+            const isTextFile =
+              mime.startsWith('text/') ||
+              mime === 'application/json' ||
+              mime === 'application/xml' ||
+              /\.(txt|md|csv|json|xml|yaml|yml|log|ini|cfg|conf|sh|py|js|ts|html|css|sql|env)$/i.test(
+                fileName,
+              );
+            if (isTextFile) {
+              try {
+                const buffer = (await downloadMediaMessage(
+                  msg,
+                  'buffer',
+                  {},
+                )) as Buffer;
+                const textContent = buffer.toString('utf-8');
+                const header = `[File: ${fileName}]`;
+                content = content
+                  ? `${content}\n\n${header}\n${textContent}`
+                  : `${header}\n${textContent}`;
+              } catch (err) {
+                logger.warn(
+                  { err, fileName },
+                  'Failed to download text file attachment',
+                );
+                content = content || `[File: ${fileName} — download failed]`;
+              }
+            } else {
+              // Binary document (zip, pdf, xlsx, docx, etc.): download into
+              // attachments/ so the agent can unzip / parse / inspect it via
+              // its normal tools. Tell the agent the relative path.
+              try {
+                const buffer = (await downloadMediaMessage(
+                  msg,
+                  'buffer',
+                  {},
+                )) as Buffer;
+                const groupDir = path.join(GROUPS_DIR, groups[chatJid].folder);
+                const attachDir = path.join(groupDir, 'attachments');
+                fs.mkdirSync(attachDir, { recursive: true });
+                // Sanitize filename and prefix with a timestamp so concurrent
+                // sends or repeated names don't clobber each other.
+                const safeName = fileName.replace(/[^A-Za-z0-9._-]/g, '_');
+                const stamped = `${Date.now()}-${safeName}`;
+                const filePath = path.join(attachDir, stamped);
+                fs.writeFileSync(filePath, buffer);
+                const relativePath = `attachments/${stamped}`;
+                const header = `[File: ${relativePath} (${mime}, ${buffer.length} bytes)]`;
+                content = content ? `${content}\n\n${header}` : header;
+                logger.info(
+                  { jid: chatJid, fileName, mime, bytes: buffer.length },
+                  'Saved binary attachment',
+                );
+              } catch (err) {
+                logger.warn(
+                  { err, fileName },
+                  'Failed to download binary attachment',
+                );
+                content =
+                  content ||
+                  `[File attached: ${fileName} (${mime}) — download failed]`;
+              }
+            }
+          }
+
+          // WhatsApp group mentions use the LID in raw text (e.g. "@80355281346633")
+          // instead of the display name. Normalize to @AssistantName for trigger matching.
+          if (this.botLidUser && content.includes(`@${this.botLidUser}`)) {
+            content = content.replace(
+              `@${this.botLidUser}`,
+              `@${ASSISTANT_NAME}`,
+            );
+          }
+
+          // Skip protocol messages with no text content (encryption keys, read receipts, etc.)
+          // but allow voice messages through for transcription
+          if (!content && !isVoiceMessage(msg)) continue;
+
+          const sender = msg.key.participant || msg.key.remoteJid || '';
+          const senderName = msg.pushName || sender.split('@')[0];
+
+          const fromMe = msg.key.fromMe || false;
+          // Detect bot messages: with own number, fromMe is reliable
+          // since only the bot sends from that number.
+          // With shared number, bot messages carry the assistant name prefix
+          // (even in DMs/self-chat) so we check for that.
+          const isBotMessage = ASSISTANT_HAS_OWN_NUMBER
+            ? fromMe
+            : content.startsWith(`${ASSISTANT_NAME}:`);
+
+          // Transcribe voice messages before storing
+          let finalContent = content;
+          if (isVoiceMessage(msg)) {
+            try {
+              const transcript = await transcribeAudioMessage(msg, this.sock);
+              if (transcript) {
+                finalContent = `[Voice: ${transcript}]`;
+                logger.info(
+                  { chatJid, length: transcript.length },
+                  'Transcribed voice message',
+                );
+              } else {
+                finalContent = '[Voice Message - transcription unavailable]';
+              }
+            } catch (err) {
+              logger.error({ err }, 'Voice transcription error');
+              finalContent = '[Voice Message - transcription failed]';
+            }
+          }
+
+          // Track whether the most recent user message was a voice note,
+          // so sendMessage can decide whether to also send a voice reply.
+          if (!isBotMessage) {
+            this.lastInboundWasVoice.set(chatJid, isVoiceMessage(msg));
+          }
+
+          this.opts.onMessage(chatJid, {
+            id: msg.key.id || '',
+            chat_jid: chatJid,
+            sender,
+            sender_name: senderName,
+            content: finalContent,
+            timestamp,
+            is_from_me: fromMe,
+            is_bot_message: isBotMessage,
+          });
+        } else if (chatJid !== rawJid) {
+          // LID translation produced a JID that doesn't match any registered group
+          logger.warn(
+            {
+              rawJid,
+              translatedJid: chatJid,
+              registeredJids: Object.keys(groups),
+            },
+            'Message JID not found in registered groups after translation',
+          );
+        }
+      }
+    });
+  }
+
+  async sendMessage(jid: string, text: string): Promise<void> {
+    // Extract any [Attach: path] markers — agents use these to send files.
+    const { cleanedText, attachments } = extractAttachments(text);
+
+    // Send each attachment as a document. Best-effort: a failure on one
+    // doesn't stop the rest, and the cleaned text still gets sent.
+    if (this.connected && attachments.length > 0) {
+      const group = this.opts.registeredGroups()[jid];
+      if (group) {
+        for (const rel of attachments) {
+          await this.sendFileAttachment(jid, group.folder, rel);
+        }
+      } else {
+        logger.warn({ jid }, 'Attach marker but JID not in registered groups');
+      }
+    }
+
+    // If after stripping attachments there's no text left, we're done —
+    // unless the user sent a voice note, in which case we still want a
+    // voice reply summarizing the file send.
+    if (!cleanedText && !this.lastInboundWasVoice.get(jid)) return;
+    const effectiveText = cleanedText || 'Sent.';
+
+    // Prefix bot messages with assistant name so users know who's speaking.
+    // On a shared number, prefix is also needed in DMs (including self-chat)
+    // to distinguish bot output from user messages.
+    // Skip only when the assistant has its own dedicated phone number.
+    const prefixed = ASSISTANT_HAS_OWN_NUMBER
+      ? effectiveText
+      : `${ASSISTANT_NAME}: ${effectiveText}`;
+
+    if (!this.connected) {
+      this.outgoingQueue.push({ jid, text: prefixed });
+      logger.info(
+        { jid, length: prefixed.length, queueSize: this.outgoingQueue.length },
+        'WA disconnected, message queued',
+      );
+      return;
+    }
+    try {
+      const sent = await this.sock.sendMessage(jid, { text: prefixed });
+      // Cache for retry requests (recipient may ask us to re-encrypt)
+      if (sent?.key?.id && sent.message) {
+        this.sentMessageCache.set(sent.key.id, sent.message);
+        if (this.sentMessageCache.size > 256) {
+          const oldest = this.sentMessageCache.keys().next().value!;
+          this.sentMessageCache.delete(oldest);
+        }
+      }
+      logger.info({ jid, length: prefixed.length }, 'Message sent');
+    } catch (err) {
+      // If send fails, queue it for retry on reconnect
+      this.outgoingQueue.push({ jid, text: prefixed });
+      logger.warn(
+        { jid, err, queueSize: this.outgoingQueue.length },
+        'Failed to send, message queued',
+      );
+      return;
+    }
+
+    // Mirror voice-only: send a voice note alongside the text only when the
+    // user's most recent message in this chat was itself a voice note. Text
+    // replies stay text-only to avoid unwanted audio for typed conversations.
+    if (!this.lastInboundWasVoice.get(jid)) return;
+
+    // Best-effort voice synthesis: failures (TTS error, too-long text, audio
+    // send error) are logged and ignored since the text has already been
+    // delivered.
+    const audio = await synthesizeSpeech(effectiveText);
+    if (!audio) return;
+    try {
+      const sent = await this.sock.sendMessage(jid, {
+        audio,
+        mimetype: 'audio/ogg; codecs=opus',
+        ptt: true,
+      });
+      if (sent?.key?.id && sent.message) {
+        this.sentMessageCache.set(sent.key.id, sent.message);
+        if (this.sentMessageCache.size > 256) {
+          const oldest = this.sentMessageCache.keys().next().value!;
+          this.sentMessageCache.delete(oldest);
+        }
+      }
+      logger.info(
+        { jid, textLength: text.length, audioBytes: audio.length },
+        'Voice note sent',
+      );
+    } catch (err) {
+      logger.warn({ jid, err }, 'Voice note send failed (text already sent)');
+    }
+  }
+
+  /**
+   * Read a file from the group folder and send it as a WhatsApp document.
+   * The relative path is resolved against the host-side group dir and
+   * checked to stay inside it (no .. escapes).
+   */
+  private async sendFileAttachment(
+    jid: string,
+    groupFolder: string,
+    relativePath: string,
+  ): Promise<void> {
+    const groupRoot = path.resolve(GROUPS_DIR, groupFolder);
+    const resolved = path.resolve(groupRoot, relativePath);
+    if (!resolved.startsWith(groupRoot + path.sep) && resolved !== groupRoot) {
+      logger.warn(
+        { jid, relativePath },
+        'Attach path escapes group folder, skipping',
+      );
+      return;
+    }
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+      logger.warn(
+        { jid, resolved },
+        'Attach path does not point to a file, skipping',
+      );
+      return;
+    }
+    const buffer = fs.readFileSync(resolved);
+    const fileName = path.basename(resolved);
+    const mimetype = mimetypeForExt(path.extname(fileName));
+    try {
+      const sent = await this.sock.sendMessage(jid, {
+        document: buffer,
+        fileName,
+        mimetype,
+      });
+      if (sent?.key?.id && sent.message) {
+        this.sentMessageCache.set(sent.key.id, sent.message);
+        if (this.sentMessageCache.size > 256) {
+          const oldest = this.sentMessageCache.keys().next().value!;
+          this.sentMessageCache.delete(oldest);
+        }
+      }
+      logger.info(
+        { jid, fileName, mimetype, bytes: buffer.length },
+        'Attachment sent',
+      );
+    } catch (err) {
+      logger.warn({ jid, fileName, err }, 'Attachment send failed');
+    }
+  }
+
+  isConnected(): boolean {
+    return this.connected;
+  }
+
+  ownsJid(jid: string): boolean {
+    return (
+      jid.endsWith('@g.us') ||
+      jid.endsWith('@s.whatsapp.net') ||
+      jid.endsWith('@lid')
+    );
+  }
+
+  async disconnect(): Promise<void> {
+    this.connected = false;
+    this.sock?.end(undefined);
+  }
+
+  async setTyping(jid: string, isTyping: boolean): Promise<void> {
+    try {
+      const status = isTyping ? 'composing' : 'paused';
+      logger.debug({ jid, status }, 'Sending presence update');
+      await this.sock.sendPresenceUpdate(status, jid);
+    } catch (err) {
+      logger.debug({ jid, err }, 'Failed to update typing status');
+    }
+  }
+
+  /**
+   * Sync group metadata from WhatsApp.
+   * Fetches all participating groups and stores their names in the database.
+   * Called on startup, daily, and on-demand via IPC.
+   */
+  async syncGroupMetadata(force = false): Promise<void> {
+    if (!force) {
+      const lastSync = getLastGroupSync();
+      if (lastSync) {
+        const lastSyncTime = new Date(lastSync).getTime();
+        if (Date.now() - lastSyncTime < GROUP_SYNC_INTERVAL_MS) {
+          logger.debug({ lastSync }, 'Skipping group sync - synced recently');
+          return;
+        }
+      }
+    }
+
+    try {
+      logger.info('Syncing group metadata from WhatsApp...');
+      const groups = await this.sock.groupFetchAllParticipating();
+
+      let count = 0;
+      for (const [jid, metadata] of Object.entries(groups)) {
+        if (metadata.subject) {
+          updateChatName(jid, metadata.subject);
+          count++;
+        }
+      }
+
+      setLastGroupSync();
+      logger.info({ count }, 'Group metadata synced');
+    } catch (err) {
+      logger.error({ err }, 'Failed to sync group metadata');
+    }
+  }
+
+  private scheduleReconnect(attempt: number): void {
+    const delayMs = Math.min(5000 * Math.pow(2, attempt - 1), 300000);
+    logger.info({ attempt, delayMs }, 'Reconnecting...');
+    setTimeout(() => {
+      this.connectInternal().catch((err) => {
+        logger.error({ err, attempt }, 'Reconnection attempt failed');
+        this.scheduleReconnect(attempt + 1);
+      });
+    }, delayMs);
+  }
+
+  private async translateJid(jid: string): Promise<string> {
+    if (!jid.endsWith('@lid')) return jid;
+    const lidUser = jid.split('@')[0].split(':')[0];
+
+    // Check local cache first
+    const cached = this.lidToPhoneMap[lidUser];
+    if (cached) {
+      logger.debug(
+        { lidJid: jid, phoneJid: cached },
+        'Translated LID to phone JID (cached)',
+      );
+      return cached;
+    }
+
+    // Query Baileys' signal repository for the mapping
+    try {
+      const pn = await (
+        this.sock.signalRepository as any
+      )?.lidMapping?.getPNForLID(jid);
+      if (pn) {
+        const phoneJid = `${pn.split('@')[0].split(':')[0]}@s.whatsapp.net`;
+        this.setLidPhoneMapping(lidUser, phoneJid);
+        logger.info(
+          { lidJid: jid, phoneJid },
+          'Translated LID to phone JID (signalRepository)',
+        );
+        return phoneJid;
+      }
+    } catch (err) {
+      logger.debug({ err, jid }, 'Failed to resolve LID via signalRepository');
+    }
+
+    return jid;
+  }
+
+  private setLidPhoneMapping(lidUser: string, phoneJid: string): void {
+    if (this.lidToPhoneMap[lidUser] === phoneJid) return;
+    this.lidToPhoneMap[lidUser] = phoneJid;
+    // Participant IDs in cached group metadata depend on this mapping.
+    this.groupMetadataCache.clear();
+  }
+
+  private async getNormalizedGroupMetadata(
+    jid: string,
+    forceRefresh = false,
+  ): Promise<GroupMetadata | undefined> {
+    if (!jid.endsWith('@g.us')) return undefined;
+
+    const cached = this.groupMetadataCache.get(jid);
+    if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
+      return cached.metadata;
+    }
+
+    const metadata = await this.sock.groupMetadata(jid);
+    const participants = await Promise.all(
+      metadata.participants.map(async (participant) => ({
+        ...participant,
+        id: await this.translateJid(participant.id),
+      })),
+    );
+    const normalized = { ...metadata, participants };
+    const mappedCount = participants.filter(
+      (participant, index) =>
+        participant.id !== metadata.participants[index]?.id,
+    ).length;
+
+    logger.info(
+      { jid, participantCount: participants.length, mappedCount },
+      'Prepared normalized group metadata for send',
+    );
+
+    this.groupMetadataCache.set(jid, {
+      metadata: normalized,
+      expiresAt: Date.now() + 60_000,
+    });
+    return normalized;
+  }
+
+  private async flushOutgoingQueue(): Promise<void> {
+    if (this.flushing || this.outgoingQueue.length === 0) return;
+    this.flushing = true;
+    try {
+      logger.info(
+        { count: this.outgoingQueue.length },
+        'Flushing outgoing message queue',
+      );
+      while (this.outgoingQueue.length > 0) {
+        const item = this.outgoingQueue.shift()!;
+        // Send directly — queued items are already prefixed by sendMessage
+        const sent = await this.sock.sendMessage(item.jid, { text: item.text });
+        if (sent?.key?.id && sent.message) {
+          this.sentMessageCache.set(sent.key.id, sent.message);
+        }
+        logger.info(
+          { jid: item.jid, length: item.text.length },
+          'Queued message sent',
+        );
+      }
+    } finally {
+      this.flushing = false;
+    }
+  }
+}
+
+registerChannel('whatsapp', (opts: ChannelOpts) => {
+  const authDir = path.join(STORE_DIR, 'auth');
+  if (!fs.existsSync(path.join(authDir, 'creds.json'))) {
+    logger.warn(
+      'WhatsApp: credentials not found. Run /add-whatsapp to authenticate.',
+    );
+    return null;
+  }
+  return new WhatsAppChannel(opts);
+});
