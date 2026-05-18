@@ -50,6 +50,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         curl \
         git \
         tini \
+        zip \
         unzip \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
@@ -109,6 +110,13 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+# ---- firecrawl-cli -----------------------------------------------------------
+# Installed via npm rather than pnpm because firecrawl-cli pulls in
+# `zod-to-json-schema` which expects a zod subpath that pnpm's strict global
+# resolution doesn't satisfy (`ERR_PACKAGE_PATH_NOT_EXPORTED: ./v3`). npm's
+# global install hoists transitive deps loosely and resolves correctly.
+RUN npm install -g firecrawl-cli
 
 # ---- ncl CLI wrapper ----------------------------------------------------------
 # Actual script lives in the mounted source at /app/src/cli/ncl.ts.

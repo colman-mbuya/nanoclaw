@@ -579,7 +579,10 @@ registerChannelAdapter('whatsapp', {
             if (incomingIsVoice) {
               const audioAtt = attachments.find((a) => a.type === 'audio');
               if (audioAtt) {
-                const transcript = await transcribeAudioFile(audioAtt.localPath);
+                // localPath is relative to DATA_DIR (e.g. 'attachments/foo.ogg')
+                // — resolve it to an absolute path the transcription module can read.
+                const absPath = path.resolve(DATA_DIR, audioAtt.localPath);
+                const transcript = await transcribeAudioFile(absPath);
                 if (transcript) {
                   const prefix = `[Voice: ${transcript}]`;
                   content = content ? `${prefix}\n${content}` : prefix;
