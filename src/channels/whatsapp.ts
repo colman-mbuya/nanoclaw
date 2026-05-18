@@ -110,7 +110,8 @@ function extractAttachments(text: string): {
   for (const m of text.matchAll(ATTACH_PATTERN)) {
     attachments.push(m[1].trim());
   }
-  if (attachments.length === 0) return { cleanedText: text.trim(), attachments };
+  if (attachments.length === 0)
+    return { cleanedText: text.trim(), attachments };
   // Remove markers and any blank lines they leave behind.
   const cleaned = text
     .replace(ATTACH_PATTERN, '')
@@ -408,8 +409,43 @@ export class WhatsAppChannel implements Channel {
                 content = content || `[File: ${fileName} — download failed]`;
               }
             } else {
-              // Non-text document: mention it so the agent knows a file was sent
-              content = content || `[File attached: ${fileName} (${mime})]`;
+              // Binary document (zip, pdf, xlsx, docx, etc.): download into
+              // attachments/ so the agent can unzip / parse / inspect it via
+              // its normal tools. Tell the agent the relative path.
+              try {
+                const buffer = (await downloadMediaMessage(
+                  msg,
+                  'buffer',
+                  {},
+                )) as Buffer;
+                const groupDir = path.join(
+                  GROUPS_DIR,
+                  groups[chatJid].folder,
+                );
+                const attachDir = path.join(groupDir, 'attachments');
+                fs.mkdirSync(attachDir, { recursive: true });
+                // Sanitize filename and prefix with a timestamp so concurrent
+                // sends or repeated names don't clobber each other.
+                const safeName = fileName.replace(/[^A-Za-z0-9._-]/g, '_');
+                const stamped = `${Date.now()}-${safeName}`;
+                const filePath = path.join(attachDir, stamped);
+                fs.writeFileSync(filePath, buffer);
+                const relativePath = `attachments/${stamped}`;
+                const header = `[File: ${relativePath} (${mime}, ${buffer.length} bytes)]`;
+                content = content ? `${content}\n\n${header}` : header;
+                logger.info(
+                  { jid: chatJid, fileName, mime, bytes: buffer.length },
+                  'Saved binary attachment',
+                );
+              } catch (err) {
+                logger.warn(
+                  { err, fileName },
+                  'Failed to download binary attachment',
+                );
+                content =
+                  content ||
+                  `[File attached: ${fileName} (${mime}) — download failed]`;
+              }
             }
           }
 

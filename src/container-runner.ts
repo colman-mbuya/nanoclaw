@@ -183,9 +183,18 @@ function buildVolumeMounts(
     }
   }
 
+  // Defaults that the user CAN override via group .env. ANTHROPIC_MODEL pins
+  // the Claude model to a standard 200K-context variant. The SDK otherwise
+  // auto-selects the [1m] variant which requires paid extra usage on the
+  // user's Claude account. Override via .env to use a different model.
+  const defaultEnv: Record<string, string> = {
+    ANTHROPIC_MODEL: 'claude-sonnet-4-6',
+  };
+
+  // Layering: defaults < passthrough (group .env) < botEnv (immutable bot config).
   // Bot config wins on conflict so the user can't accidentally break
   // sub-agents by setting one of those keys in their group .env.
-  const mergedEnv = { ...passthroughEnv, ...botEnv };
+  const mergedEnv = { ...defaultEnv, ...passthroughEnv, ...botEnv };
 
   // Always overwrite settings.json so .env changes take effect on next spawn
   // without requiring the user to delete the file manually.
@@ -360,6 +369,22 @@ export async function runContainerAgent(
     containerName,
     agentIdentifier,
   );
+
+  // Pin the Claude model the SDK uses inside the container. Without this the
+  // SDK auto-selects the 1M-context variant which requires paid extra usage.
+  // Override per-group by setting ANTHROPIC_MODEL in the group .env.
+  let model = 'claude-sonnet-4-6';
+  try {
+    const envFile = path.join(GROUPS_DIR, group.folder, '.env');
+    if (fs.existsSync(envFile)) {
+      const content = fs.readFileSync(envFile, 'utf-8');
+      const m = content.match(/^\s*ANTHROPIC_MODEL\s*=\s*(.+)\s*$/m);
+      if (m) model = m[1].replace(/^['"]|['"]$/g, '').trim();
+    }
+  } catch {
+    /* keep default */
+  }
+  containerArgs.splice(containerArgs.length - 1, 0, '-e', `ANTHROPIC_MODEL=${model}`);
 
   logger.debug(
     {

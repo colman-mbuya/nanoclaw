@@ -511,6 +511,9 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
+      // Pin the model so the SDK doesn't auto-select the 1M-context variant
+      // (which requires paid extra usage). Override via ANTHROPIC_MODEL env.
+      model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6',
       systemPrompt: globalClaudeMd
         ? {
             type: 'preset' as const,

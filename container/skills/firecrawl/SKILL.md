@@ -34,6 +34,7 @@ firecrawl --status
 | Click, fill forms, login | `firecrawl interact` |
 | Bulk extract from a site section | `firecrawl crawl` |
 | Discover URL structure of a site | `firecrawl map` |
+| **Parse local PDF / DOCX / XLSX / DOC / ODT / RTF** | **`firecrawl parse`** |
 | Read-only, simple page (no JS) | `WebFetch` is fine |
 | Live interactive page (must click/login) | `agent-browser` |
 
@@ -79,6 +80,28 @@ firecrawl crawl "https://docs.example.com/guides" --limit 20 -o .firecrawl/crawl
 ```bash
 firecrawl map "https://docs.example.com" -o .firecrawl/map.json
 ```
+
+### Parse a local document (PDF, DOCX, XLSX, etc.)
+
+WhatsApp drops PDFs/spreadsheets into `attachments/` (or you unzip them into
+your workspace). **Never `Read` these raw** — the bytes will overflow your
+context. Use `firecrawl parse` to convert to compact markdown server-side:
+
+```bash
+# Summary only — best when you need a quick overview
+firecrawl parse path/to/statement.pdf -S -o /tmp/statement.md
+
+# Full markdown — when you need every detail
+firecrawl parse path/to/statement.pdf -o /tmp/statement.md
+
+# Specific question against the document
+firecrawl parse path/to/statement.pdf -Q "What is the total balance?" -o /tmp/answer.md
+```
+
+Then `Read` the produced markdown file. Supported: PDF, DOCX, DOC, ODT, RTF,
+XLSX, XLS, HTML. For many files (e.g. a zip of statements), parse only what
+you need — list the files first, summarize one at a time, or ask the user
+which to focus on.
 
 ### Check credit usage
 
