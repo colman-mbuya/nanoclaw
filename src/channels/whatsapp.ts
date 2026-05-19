@@ -201,10 +201,6 @@ registerChannelAdapter('whatsapp', {
     let botLidUser: string | undefined;
     let botPhoneJid: string | undefined;
 
-    // Outgoing queue for messages sent while disconnected
-    const outgoingQueue: Array<{ jid: string; text: string }> = [];
-    let flushing = false;
-
     // Sent message cache for retry/re-encrypt requests
     const sentMessageCache = new Map<string, any>();
 
@@ -316,23 +312,6 @@ registerChannelAdapter('whatsapp', {
       }
     }
 
-    async function flushOutgoingQueue(): Promise<void> {
-      if (flushing || outgoingQueue.length === 0) return;
-      flushing = true;
-      try {
-        log.info('Flushing outgoing message queue', { count: outgoingQueue.length });
-        while (outgoingQueue.length > 0) {
-          const item = outgoingQueue.shift()!;
-          const sent = await sock.sendMessage(item.jid, { text: item.text });
-          if (sent?.key?.id && sent.message) {
-            sentMessageCache.set(sent.key.id, sent.message);
-          }
-        }
-      } finally {
-        flushing = false;
-      }
-    }
-
     /** Download media from an inbound message, save to /workspace/attachments/. */
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     async function downloadInboundMedia(
@@ -376,26 +355,26 @@ registerChannelAdapter('whatsapp', {
     }
 
     async function sendRawMessage(jid: string, text: string): Promise<string | undefined> {
+      // Throw on disconnect / send error rather than silently queueing.
+      // The host's delivery worker has its own retry loop with backoff
+      // (MAX_DELIVERY_ATTEMPTS in delivery.ts) and marks delivered exactly
+      // once per message_out row. The previous internal-queue path produced
+      // duplicate user-visible sends: the queue would flush on reconnect
+      // AND the host's next poll would retry the same row, since the
+      // adapter had returned undefined (forcing markDelivered with a null
+      // platform_id but leaving the message visibly "stuck").
       if (!connected) {
-        outgoingQueue.push({ jid, text });
-        log.info('WA disconnected, message queued', { jid, queueSize: outgoingQueue.length });
-        return;
+        throw new Error('WhatsApp socket disconnected');
       }
-      try {
-        const sent = await sock.sendMessage(jid, { text });
-        if (sent?.key?.id && sent.message) {
-          sentMessageCache.set(sent.key.id, sent.message);
-          if (sentMessageCache.size > SENT_MESSAGE_CACHE_MAX) {
-            const oldest = sentMessageCache.keys().next().value!;
-            sentMessageCache.delete(oldest);
-          }
+      const sent = await sock.sendMessage(jid, { text });
+      if (sent?.key?.id && sent.message) {
+        sentMessageCache.set(sent.key.id, sent.message);
+        if (sentMessageCache.size > SENT_MESSAGE_CACHE_MAX) {
+          const oldest = sentMessageCache.keys().next().value!;
+          sentMessageCache.delete(oldest);
         }
-        return sent?.key?.id ?? undefined;
-      } catch (err) {
-        outgoingQueue.push({ jid, text });
-        log.warn('Failed to send, message queued', { jid, err, queueSize: outgoingQueue.length });
-        return undefined;
       }
+      return sent?.key?.id ?? undefined;
     }
 
     // --- Socket creation ---
@@ -505,9 +484,6 @@ registerChannelAdapter('whatsapp', {
               botLidUser = lidUser;
             }
           }
-
-          // Flush queued messages
-          flushOutgoingQueue().catch((err) => log.error('Failed to flush outgoing queue', { err }));
 
           // Group sync
           syncGroupMetadata().catch((err) => log.error('Initial group sync failed', { err }));
@@ -777,22 +753,26 @@ registerChannelAdapter('whatsapp', {
 
         if (!text && !hasFiles) return;
 
-        // Send file attachments (first file gets the caption, rest are captionless)
+        // Send file attachments (first file gets the caption, rest are
+        // captionless). Throws on send error rather than swallowing — host's
+        // delivery worker has the retry logic and dedup by message_out_id.
+        // Swallowing here caused the host to markDelivered for a row that
+        // wasn't actually delivered, leading to duplicate user-visible sends
+        // on the next retry / reconnect flush.
         if (hasFiles) {
+          if (!connected) {
+            throw new Error('WhatsApp socket disconnected');
+          }
           let captionUsed = false;
           for (const file of message.files!) {
-            try {
-              const ext = path.extname(file.filename).toLowerCase();
-              const caption = !captionUsed ? text : undefined;
-              const mediaMsg = buildMediaMessage(file.data, file.filename, ext, caption);
-              const sent = await sock.sendMessage(platformId, mediaMsg);
-              if (sent?.key?.id && sent.message) {
-                sentMessageCache.set(sent.key.id, sent.message);
-              }
-              if (caption) captionUsed = true;
-            } catch (err) {
-              log.error('Failed to send file', { platformId, filename: file.filename, err });
+            const ext = path.extname(file.filename).toLowerCase();
+            const caption = !captionUsed ? text : undefined;
+            const mediaMsg = buildMediaMessage(file.data, file.filename, ext, caption);
+            const sent = await sock.sendMessage(platformId, mediaMsg);
+            if (sent?.key?.id && sent.message) {
+              sentMessageCache.set(sent.key.id, sent.message);
             }
+            if (caption) captionUsed = true;
           }
           if (captionUsed) return; // Text was sent as caption
         }

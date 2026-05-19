@@ -218,16 +218,14 @@ async function main(): Promise<void> {
         });
       },
       onDeliveryFailed(platformId, platformMessageId, reason) {
-        handleDeliveryFailed(adapter.channelType, platformId, platformMessageId, reason).catch(
-          (err) => {
-            log.error('Failed to handle delivery-failure', {
-              channelType: adapter.channelType,
-              platformId,
-              platformMessageId,
-              err,
-            });
-          },
-        );
+        handleDeliveryFailed(adapter.channelType, platformId, platformMessageId, reason).catch((err) => {
+          log.error('Failed to handle delivery-failure', {
+            channelType: adapter.channelType,
+            platformId,
+            platformMessageId,
+            err,
+          });
+        });
       },
     };
   });
