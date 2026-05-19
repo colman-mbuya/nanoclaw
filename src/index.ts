@@ -46,6 +46,85 @@ async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   log.warn('Unclaimed response', { questionId: payload.questionId, value: payload.value });
 }
 
+/**
+ * Handle a delivery-failure callback from a channel adapter. Looks up the
+ * session for (channelType, platformId), downgrades the optimistic
+ * 'delivered' row in that session's inbound.db to 'failed', and injects a
+ * system message so the agent learns about it on its next poll.
+ *
+ * No-op if the messaging group / session / delivered row can't be found —
+ * a stale ack for a long-deleted session shouldn't crash anything.
+ */
+async function handleDeliveryFailed(
+  channelType: string,
+  platformId: string,
+  platformMessageId: string,
+  reason: string,
+): Promise<void> {
+  const { getMessagingGroupByPlatform } = await import('./db/messaging-groups.js');
+  const { findSession } = await import('./db/sessions.js');
+  const { openInboundDb } = await import('./session-manager.js');
+  const { downgradeDeliveredToFailed, insertMessage } = await import('./db/session-db.js');
+  const { randomUUID } = await import('crypto');
+
+  const mg = getMessagingGroupByPlatform(channelType, platformId);
+  if (!mg) {
+    log.debug('Delivery failure for unknown messaging group, ignoring', {
+      channelType,
+      platformId,
+      platformMessageId,
+    });
+    return;
+  }
+  const session = findSession(mg.id, null);
+  if (!session) {
+    log.debug('Delivery failure with no active session, ignoring', {
+      mgId: mg.id,
+      platformMessageId,
+    });
+    return;
+  }
+  const inDb = openInboundDb(session.agent_group_id, session.id);
+  const messageOutId = downgradeDeliveredToFailed(inDb, platformMessageId);
+  if (!messageOutId) {
+    log.debug('Delivery failure ack for already-failed/unknown message, ignoring', {
+      platformMessageId,
+    });
+    return;
+  }
+  // Inject a system message into the agent's inbound so the next poll
+  // surfaces the failure. Marked `kind: 'system'` so it accumulates as
+  // context rather than waking the agent on its own — Data sees it when
+  // the user's next real message wakes the container.
+  insertMessage(inDb, {
+    id: randomUUID(),
+    kind: 'system',
+    timestamp: new Date().toISOString(),
+    platformId: null,
+    channelType: null,
+    threadId: null,
+    content: JSON.stringify({
+      type: 'delivery_failed',
+      text: `Your reply (message_out=${messageOutId}) failed to deliver to ${channelType}:${platformId}. Reason: ${reason}. Consider re-sending if it was important.`,
+      messageOutId,
+      platformMessageId,
+      channelType,
+      platformId,
+      reason,
+    }),
+    processAfter: null,
+    recurrence: null,
+    trigger: 0,
+  });
+  log.info('Marked outbound message as failed after protocol ack', {
+    channelType,
+    platformId,
+    platformMessageId,
+    messageOutId,
+    reason,
+  });
+}
+
 // Channel barrel — each enabled channel self-registers on import.
 // Channel skills uncomment lines in channels/index.ts to enable them.
 import './channels/index.js';
@@ -137,6 +216,18 @@ async function main(): Promise<void> {
         }).catch((err) => {
           log.error('Failed to handle question response', { questionId, err });
         });
+      },
+      onDeliveryFailed(platformId, platformMessageId, reason) {
+        handleDeliveryFailed(adapter.channelType, platformId, platformMessageId, reason).catch(
+          (err) => {
+            log.error('Failed to handle delivery-failure', {
+              channelType: adapter.channelType,
+              platformId,
+              platformMessageId,
+              err,
+            });
+          },
+        );
       },
     };
   });

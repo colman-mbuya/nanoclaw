@@ -23,6 +23,21 @@ export interface ChannelSetup {
 
   /** Called when a user clicks a button/action in a card (e.g., ask_user_question response). */
   onAction(questionId: string, selectedOption: string, userId: string): void;
+
+  /**
+   * Called when the platform reports that a previously-sent message failed
+   * to deliver. Adapters using protocols with delivery acks (e.g. WhatsApp's
+   * `messages.update` ERROR status) emit this so the host can:
+   *
+   *   1. Downgrade the `delivered` row from 'delivered' to 'failed'.
+   *   2. Inject a system message into the agent's inbound so it can retry
+   *      or alert the user instead of believing the send succeeded.
+   *
+   * `platformMessageId` is the platform's own message id (the one
+   * `deliver()` returned). `reason` is a short human-readable string.
+   * Adapters without delivery-ack semantics may omit this callback.
+   */
+  onDeliveryFailed?(platformId: string, platformMessageId: string, reason: string): void;
 }
 
 /** Delivery address used for reply-to overrides and (normally) the inbound's own origin. */

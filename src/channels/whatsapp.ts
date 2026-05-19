@@ -538,6 +538,36 @@ registerChannelAdapter('whatsapp', {
         }
       });
 
+      // Delivery status updates for messages WE sent. `sock.sendMessage`
+      // returning successfully only means Baileys queued the message — it
+      // does NOT mean WhatsApp servers received it. The protocol surfaces
+      // status updates here. We only care about ERROR (0), which means the
+      // send permanently failed; SERVER_ACK (2) / DELIVERY_ACK (3) / READ (4)
+      // are positive signals we don't need to track for delivery-state.
+      //
+      // When an ERROR arrives for a fromMe message, hand it off to the host
+      // via onDeliveryFailed so it can downgrade the delivered row and
+      // inject a system message into the agent's inbound.
+      sock.ev.on('messages.update', (updates) => {
+        for (const u of updates) {
+          if (!u.key.fromMe) continue;
+          const status = u.update.status;
+          if (status === undefined || status === null) continue;
+          // proto.WebMessageInfo.Status.ERROR is 0; explicitly compare to
+          // avoid false positives from undefined/null.
+          if (status !== 0) continue;
+          const platformId = u.key.remoteJid;
+          const platformMessageId = u.key.id;
+          if (!platformId || !platformMessageId) continue;
+          log.warn('WhatsApp message delivery failed', {
+            platformId,
+            platformMessageId,
+            status,
+          });
+          setupConfig.onDeliveryFailed?.(platformId, platformMessageId, `WhatsApp delivery status ERROR (${status})`);
+        }
+      });
+
       // Inbound messages
       sock.ev.on('messages.upsert', async ({ messages }) => {
         for (const msg of messages) {

@@ -289,6 +289,24 @@ export function markDeliveryFailed(db: Database.Database, messageOutId: string):
   ).run(messageOutId);
 }
 
+/**
+ * Downgrade a delivered row to 'failed' after-the-fact, using the platform's
+ * own message id. Used when the channel adapter receives a protocol-level
+ * delivery failure (e.g. WhatsApp `messages.update` with status=ERROR) for a
+ * message we previously marked 'delivered' optimistically.
+ *
+ * Returns the messages_out id of the affected row, or null if no row was
+ * updated (already failed, or platform id unknown).
+ */
+export function downgradeDeliveredToFailed(db: Database.Database, platformMessageId: string): string | null {
+  const row = db
+    .prepare("SELECT message_out_id FROM delivered WHERE platform_message_id = ? AND status = 'delivered'")
+    .get(platformMessageId) as { message_out_id: string } | undefined;
+  if (!row) return null;
+  db.prepare("UPDATE delivered SET status = 'failed' WHERE message_out_id = ?").run(row.message_out_id);
+  return row.message_out_id;
+}
+
 /** Ensure the delivered table has columns added after initial schema. */
 export function migrateDeliveredTable(db: Database.Database): void {
   const cols = new Set(
