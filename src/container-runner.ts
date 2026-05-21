@@ -299,6 +299,28 @@ function buildMounts(
     mounts.push({ hostPath: globalDir, containerPath: '/workspace/global', readonly: true });
   }
 
+  // Inbound channel attachments (voice notes, images, documents). Nested
+  // RO mount inside /workspace so the agent can read them at the path the
+  // inbound-message formatter advertises (`/workspace/attachments/<name>`).
+  //
+  // Channel adapters currently save inbound media to `DATA_DIR/attachments/`
+  // directly (rather than per-session inboxes via extractAttachmentFiles),
+  // which leaves the files outside the session-dir mount. Without this
+  // nested mount the agent sees the localPath but the file isn't there.
+  //
+  // Single-tenant note: this dir is shared across all groups, so every
+  // agent group sees every group's inbound media. Acceptable for a
+  // single-user install; a multi-tenant deployment would need adapters
+  // to switch to base64-via-extractAttachmentFiles for proper isolation.
+  const attachmentsDir = path.join(DATA_DIR, 'attachments');
+  if (fs.existsSync(attachmentsDir)) {
+    mounts.push({
+      hostPath: attachmentsDir,
+      containerPath: '/workspace/attachments',
+      readonly: true,
+    });
+  }
+
   // Shared CLAUDE.md — read-only, imported by the composed entry point via
   // the `.claude-shared.md` symlink inside the group dir.
   const sharedClaudeMd = path.join(process.cwd(), 'container', 'CLAUDE.md');
