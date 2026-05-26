@@ -3,7 +3,7 @@ import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } 
 import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
-import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
+import { clearCurrentInReplyTo, setCurrentInReplyTo, shouldSendInBatch } from './current-batch.js';
 import {
   formatMessages,
   extractRouting,
@@ -473,6 +473,15 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
 function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
+  // Per-batch dedup: skip if the same body was already sent to this
+  // destination in the current turn (e.g. via an earlier send_message MCP
+  // call or an earlier <message> block in the same final-response text).
+  // The model sometimes emits the same content via multiple paths.
+  const destinationKey = `${channelType}:${platformId}`;
+  if (!shouldSendInBatch(destinationKey, body)) {
+    log(`Dispatch <message> suppressed (duplicate of earlier send) → ${dest.name}`);
+    return;
+  }
   // Resolve thread_id per-destination from the most recent inbound message
   // that came from this same channel+platform. In agent-shared sessions,
   // different destinations have different thread contexts — using a single

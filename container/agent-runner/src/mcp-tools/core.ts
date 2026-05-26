@@ -9,7 +9,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { getCurrentInReplyTo } from '../current-batch.js';
+import { getCurrentInReplyTo, shouldSendInBatch } from '../current-batch.js';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
@@ -114,6 +114,16 @@ export const sendMessage: McpToolDefinition = {
 
     const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
+
+    // Per-batch dedup: suppress send_message calls whose content has already
+    // been sent (via an earlier tool call or <message> block) in this turn.
+    // Stops the "Data sent the same reply 3 times" class of bug where the
+    // model emits the same content via multiple delivery paths.
+    const destinationKey = `${routing.channel_type}:${routing.platform_id}`;
+    if (!shouldSendInBatch(destinationKey, text)) {
+      log(`send_message: suppressed duplicate for ${routing.resolvedName}`);
+      return ok(`Message already sent to ${routing.resolvedName} (duplicate suppressed)`);
+    }
 
     const id = generateId();
     const seq = writeMessageOut({
