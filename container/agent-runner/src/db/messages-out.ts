@@ -33,6 +33,71 @@ export interface WriteMessageOut {
 }
 
 /**
+ * Normalise an outbound message's text for duplicate comparison. Returns null
+ * when the message should never be deduped (edits/reactions, file-only sends,
+ * empty text). Mirrors the fingerprinting in current-batch.ts so both layers
+ * agree on what "the same message" means.
+ */
+function normalizeForDedup(content: string): string | null {
+  let text: string;
+  try {
+    const parsed = JSON.parse(content) as { text?: unknown; files?: unknown; operation?: unknown };
+    if (parsed.operation) return null; // edit / reaction — never dedup
+    const hasFiles = Array.isArray(parsed.files) && parsed.files.length > 0;
+    text = typeof parsed.text === 'string' ? parsed.text : '';
+    if (hasFiles && text.trim() === '') return null; // file-only send
+  } catch {
+    text = content;
+  }
+  if (text.trim() === '') return null;
+  return text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // strip markdown link URLs
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Cross-process duplicate suppression. The MCP tool server (send_message /
+ * send_file) runs in a SEPARATE process from the poll-loop that dispatches
+ * <message> blocks, so the in-memory per-batch dedup in current-batch.ts
+ * cannot catch a reply the model emitted via BOTH paths — each process has
+ * its own state. outbound.db is the only shared medium, so we dedup here:
+ * if an equivalent chat message (same destination + normalized text) was
+ * written in the last 30 seconds, skip the insert and reuse the prior seq.
+ *
+ * The 30s window catches the dual-path duplicate (the two sends land within
+ * seconds) without suppressing a genuinely repeated template (reminders etc.)
+ * that recurs minutes or hours apart in a later batch.
+ */
+function findRecentDuplicateSeq(
+  outbound: ReturnType<typeof getOutboundDb>,
+  msg: WriteMessageOut,
+): number | null {
+  if (msg.kind !== 'chat') return null;
+  const norm = normalizeForDedup(msg.content);
+  if (norm === null) return null;
+  const rows = outbound
+    .prepare(
+      `SELECT seq, content FROM messages_out
+       WHERE kind = 'chat'
+         AND IFNULL(platform_id, '') = IFNULL($platform_id, '')
+         AND IFNULL(channel_type, '') = IFNULL($channel_type, '')
+         AND IFNULL(thread_id, '') = IFNULL($thread_id, '')
+         AND timestamp >= datetime('now', '-30 seconds')`,
+    )
+    .all({
+      $platform_id: msg.platform_id ?? null,
+      $channel_type: msg.channel_type ?? null,
+      $thread_id: msg.thread_id ?? null,
+    }) as { seq: number; content: string }[];
+  for (const r of rows) {
+    if (normalizeForDedup(r.content) === norm) return r.seq;
+  }
+  return null;
+}
+
+/**
  * Write a new outbound message, auto-assigning an odd seq number.
  * Container uses odd seq (1, 3, 5...), host uses even (2, 4, 6...).
  *
@@ -45,6 +110,15 @@ export interface WriteMessageOut {
 export function writeMessageOut(msg: WriteMessageOut): number {
   const outbound = getOutboundDb();
   const inbound = getInboundDb();
+
+  // Cross-process duplicate suppression (see findRecentDuplicateSeq). Returns
+  // the existing row's seq so callers still get a valid id, but no second
+  // physical message is delivered.
+  const dupSeq = findRecentDuplicateSeq(outbound, msg);
+  if (dupSeq !== null) {
+    console.error(`[messages-out] suppressed cross-process duplicate → reusing seq ${dupSeq}`);
+    return dupSeq;
+  }
 
   // Read max seq from both DBs to maintain global ordering.
   // Safe: each side only reads the other DB, never writes to it.
