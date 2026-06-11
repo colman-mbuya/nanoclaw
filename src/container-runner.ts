@@ -321,6 +321,18 @@ function buildMounts(
     });
   }
 
+  // Per-group SSH credentials for git over SSH. If a host-side ssh dir exists
+  // for this group (data/agent-ssh/<folder>/ holding a dedicated key + config
+  // + known_hosts), mount it read-only at /home/node/.ssh so the agent's git
+  // can authenticate with a repo-scoped key. Kept outside /workspace so the
+  // key is not visible in the agent's working tree. Container runs as the same
+  // uid as the host owner, so a 600 key file loads cleanly under ssh strict
+  // mode.
+  const groupSshDir = path.join(DATA_DIR, 'agent-ssh', agentGroup.folder);
+  if (fs.existsSync(groupSshDir)) {
+    mounts.push({ hostPath: groupSshDir, containerPath: '/home/node/.ssh', readonly: true });
+  }
+
   // Shared CLAUDE.md — read-only, imported by the composed entry point via
   // the `.claude-shared.md` symlink inside the group dir.
   const sharedClaudeMd = path.join(process.cwd(), 'container', 'CLAUDE.md');

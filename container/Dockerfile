@@ -24,6 +24,14 @@ ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=52.2.1
 ARG BUN_VERSION=1.3.12
 
+# Runtime uid/gid. The host launches the container with `--user <uid>:<gid>`
+# matching the host owner (so writes to mounted dirs are correctly owned).
+# That uid usually differs from the image's `node` user (1000), leaving it with
+# no /etc/passwd entry — which makes OpenSSH (and anything else calling
+# getpwuid) fatally error. build.sh passes the real host id; default to 1000.
+ARG HOST_UID=1000
+ARG HOST_GID=1000
+
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
 # SIGTERM instead of being orphaned by the shell entrypoint.
@@ -49,6 +57,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ca-certificates \
         curl \
         git \
+        openssh-client \
         tini \
         zip \
         unzip \
@@ -56,6 +65,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \
     && rm -rf /var/lib/apt/lists/*
+
+# Ensure the runtime uid/gid resolves to a passwd/group entry (see HOST_UID
+# note above). Guarded so it's a no-op when the id already exists (e.g. when
+# HOST_UID == 1000, the node user). Home is /home/node so HOME + ~/.ssh work.
+RUN if ! getent group "${HOST_GID}" >/dev/null; then echo "agent:x:${HOST_GID}:" >> /etc/group; fi && \
+    if ! getent passwd "${HOST_UID}" >/dev/null; then \
+      echo "agent:x:${HOST_UID}:${HOST_GID}:agent:/home/node:/bin/bash" >> /etc/passwd; \
+    fi
 
 # Chromium path for agent-browser / Playwright consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium

@@ -27,6 +27,10 @@ if [ -z "${INSTALL_CJK_FONTS:-}" ] && [ -f "../.env" ]; then
 fi
 
 BUILD_ARGS=()
+# Bake a passwd/group entry for the runtime uid/gid. The host launches the
+# container as `--user $(id -u):$(id -g)`; without a matching entry, OpenSSH
+# and other getpwuid() callers fatally error inside the container.
+BUILD_ARGS+=(--build-arg "HOST_UID=$(id -u)" --build-arg "HOST_GID=$(id -g)")
 if [ "${INSTALL_CJK_FONTS:-false}" = "true" ]; then
     echo "CJK fonts: enabled (adds ~200MB)"
     BUILD_ARGS+=(--build-arg INSTALL_CJK_FONTS=true)
